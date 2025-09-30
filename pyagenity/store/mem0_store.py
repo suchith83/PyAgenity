@@ -192,6 +192,8 @@ class Mem0Store(BaseStore):
             **(metadata or {}),
         }
 
+        infer = kwargs.get("infer", True)
+
         client = await self._get_client()
         result = await client.add(  # type: ignore
             messages=[{"role": "user", "content": text}],
@@ -199,6 +201,7 @@ class Mem0Store(BaseStore):
             agent_id=app_id,
             run_id=thread_id,
             metadata=mem_meta,
+            infer=infer,
         )
 
         logger.debug("Stored memory for user=%s thread=%s id=%s", user_id, thread_id, result)
@@ -231,8 +234,8 @@ class Mem0Store(BaseStore):
             threshold=score_threshold,
         )
 
-        if "original_results" not in result:
-            logger.warning("Mem0 search response missing 'original_results': %s", result)
+        if "results" not in result:
+            logger.warning("Mem0 search response missing 'results': %s", result)
             return []
 
         if "relations" in result:
@@ -242,7 +245,7 @@ class Mem0Store(BaseStore):
             )
 
         out: list[MemorySearchResult] = [
-            self._create_result(raw, user_id) for raw in result["original_results"]
+            self._create_result(raw, user_id) for raw in result["results"]
         ]
 
         logger.debug(
