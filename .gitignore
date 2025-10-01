@@ -71,3 +71,8 @@ cython_debug/
 .env
 .env.*
 *.env
+
+.venv/
+.vscode/
+*.bin
+chroma.sqlite3

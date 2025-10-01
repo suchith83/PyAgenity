@@ -548,6 +548,80 @@ class DBAgent():
         app.invoke(input, config=config)
         return qdrant_store
     
+
+import re
+import json
+
+
+MUTATING_RE = re.compile(
+    r"(?is)\b(INSERT|UPDATE|DELETE|UPSERT|MERGE|ALTER|DROP|TRUNCATE|VACUUM|REINDEX|GRANT|REVOKE|CREATE|COPY|ROLLBACK|COMMIT|BEGIN|START|SAVEPOINT|RELEASE|SET)\b"
+)
+HAS_LIMIT_RE = re.compile(r"(?is)\bLIMIT\s+\d+")
+STARTS_WITH_SELECT_OR_WITH_RE = re.compile(r"(?is)^(\s*WITH\b|\s*SELECT\b)")
+
+def strip_sql_fences(txt: str) -> str:
+    t = txt.strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+    t = t.strip()
+    if t.lower().startswith("sql"):
+        t = t[3:]
+    return t.strip()
+
+def sanitize_input(user_q: str) -> None:
+    q = (user_q or "").strip()
+    # length limit per your needs
+    if len(q) == 0:
+        raise ValueError("input cannot be empty")
+    suspicious = ["--", "/*", "*/", "xp_", "sp_", "exec", "execute", "union", "information_schema", "pg_catalog"]
+    low = q.lower()
+    for pat in suspicious:
+        if pat in low:
+            logger.warning(f"suspicious pattern in input: {pat}")
+
+def guard_read_only(sql: str) -> None:
+    s = sql.strip()
+    if not STARTS_WITH_SELECT_OR_WITH_RE.match(s):
+        raise ValueError("only SELECT/WITH queries are allowed")
+    if ";" in s:
+        raise ValueError("semicolons / multiple statements are not allowed")
+    if MUTATING_RE.search(s):
+        raise ValueError("refusing to run non-read-only SQL")
+
+def validate_sql_basic(sql: str) -> None:
+    low = sql.lower()
+    if "select" not in low:
+        raise ValueError("query must contain SELECT")
+    if sql.count("(") != sql.count(")"):
+        raise ValueError("unbalanced parentheses")
+    if "select select" in low:
+        raise ValueError("duplicated SELECT keywords")
+
+def ensure_limit(sql: str, limit: int) -> str:
+    if HAS_LIMIT_RE.search(sql):
+        return sql
+    return f"WITH query AS ({sql}) SELECT * FROM query LIMIT {limit}"
+
+async def execute_query_readonly(conn_pool, sql: str, limit: int = 50, timeout_s: int = 25) -> List[Dict[str, Any]]:
+    conn = await conn_pool.acquire()
+    try:
+        async with conn.transaction(readonly=True):
+            # Optional: enforce timeout at server level
+            try:
+                await conn.execute(f"SET LOCAL statement_timeout = '{timeout_s}s'")
+            except Exception:
+                pass
+            # Ensure limit server-side too
+            safe_sql = ensure_limit(sql, limit)
+            rows = await conn.fetch(safe_sql)
+            out = []
+            for r in rows:
+                # asyncpg.Record -> dict
+                out.append(dict(r))
+            return out
+    finally:
+        await conn_pool.release(conn)
+
 logging.basicConfig(level=logging.INFO)
 class DBQueryState(AgentState):
     user_id: str = ""
@@ -571,16 +645,51 @@ class DBQueryAgent():
         self.db_store = db_store
         self.db_url = db_url
 
+    def _create_pg_pool(self, pg_pool: Any, postgres_dsn: str | None, pool_config: dict) -> Any:
+        """
+        Create or use an existing PostgreSQL connection pool.
 
-    async def main_agent(self, state: DBQueryState, store: Any):
+        Args:
+            pg_pool (Any, optional): Existing asyncpg Pool instance.
+            postgres_dsn (str, optional): PostgreSQL connection string.
+            pool_config (dict): Configuration for new pg pool creation.
+
+        Returns:
+            Pool: PostgreSQL connection pool.
+        """
+        if pg_pool:
+            return pg_pool
+        # as we are creating new pool, postgres_dsn must be provided
+        # and we will release the resources if needed
+        self.release_resources = True
+        return asyncpg.create_pool(dsn=postgres_dsn, **pool_config)  # type: ignore
+    
+
+    async def execute_query(self, sql_query: str, limit: int = 50, timeout_s: int = 25):
+        pg_pool = await self._create_pg_pool(pg_pool=None, postgres_dsn=self.db_url, pool_config={})
+        conn = await pg_pool.acquire()
+        try:
+            async with conn.transaction(readonly=True):
+                try:
+                    await conn.execute(f"SET LOCAL statement_timeout = '{timeout_s}s'")
+                except Exception:
+                    pass
+                safe_sql = ensure_limit(sql_query, limit)
+                rows = await conn.fetch(safe_sql)
+                return [dict(r) for r in rows]
+        finally:
+            await pg_pool.release(conn)
+
+    async def main_agent(self, state: DBQueryState, store: BaseStore | None = Inject[BaseStore]):
         # fetches the relevant schema and templates from long term memory (db_store)
         # Also fetches the relevant previous queries and results from own store.
         # Then uses all this information to generate a sql query using the templates.
         # Then executes the query on the database and gets the results.
         # Then uses the results to answer the user question. or Directly returns the results.
+        logger.info("entered main_agent")
         messages = convert_messages([], state)
-        user_message = messages[-1].content if messages else ""
-        user_id = state.user_id
+        user_message = messages[-1]["content"] if messages else ""
+        user_id = state.user_id or "anonymous"
         memory_context = ""
         try:
             config = {"user_id": "db_agent", "thread_id": "db_agent_thread", "app_id": "db_agent"}
@@ -602,26 +711,89 @@ class DBQueryAgent():
         except Exception as e:
             logger.error(f"Error in main_agent: {e}")
 
-        system_prompt = f"""You are a helpful AI assistant with memory of past conversations.
+        max_rows = 200
+        system_prompt = f"""
+        You translate plain English questions into a SINGLE, safe PostgreSQL query.
 
-{memory_context}
+        Rules:
+        - ONLY read-only SQL (WITH/SELECT). No writes, DDL, or side effects.
+        - SINGLE statement, NO semicolons.
+        - Include an explicit LIMIT <= {max_rows} (unless it's a COUNT query).
+        - Use table and column names EXACTLY as shown in the schema/context.
+        - Quote identifiers as needed to match the schema.
+        - Return ONLY the raw SQL string. 
+            Do not wrap it in backticks, code fences, language tags, explanations, or extra characters. 
+            The output must begin with SELECT (or WITH). 
+        - Respond ONLY in valid JSON, no markdown formatting. 
+            Format: {{"sql": "<query>"}}
+            The value must contain ONLY the SQL query string. 
 
-Be conversational, helpful, and reference past interactions when relevant. 
-Show that you remember previous topics and user preferences."""
+        Schema/context:
+        {memory_context}
+        """.strip()
 
         # Convert messages for LLM
-        messages = convert_messages(
-            system_prompts=[{"role": "system", "content": system_prompt}], state=state
-        )
+        sanitize_input(user_message)
+        # messages = convert_messages(
+        #     system_prompts=[{"role": "system", "content": system_prompt}], state=state
+        # )
+
+        llm_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Question: {user_message}\nReturn ONLY SQL."},
+        ]
 
         # Generate response using LiteLLM
         # try:
         response = await acompletion(
-            model="gemini/gemini-2.0-flash-exp", messages=messages, temperature=0.7
+            model="gemini/gemini-2.0-flash-exp", messages=llm_messages, temperature=0.2, max_tokens=800
         )
+        # sql_raw = response.choices[0].message.content
+        # sql_raw = re.sub(r"^```sql\s*|\s*```$", "", sql_raw.strip(), flags=re.MULTILINE)
+        raw_content = response.choices[0].message.content.strip()
 
-        assistant_content = response.choices[0].message.content
-        assistant_message = Message.text_message(assistant_content, role="assistant")
+        # Strip ```json ... ``` or ``` ... ``` fences if they exist
+        if raw_content.startswith("```"):
+            raw_content = re.sub(r"^```[a-zA-Z]*\n?", "", raw_content)
+            raw_content = re.sub(r"\n?```$", "", raw_content)
+
+        try:
+            parsed = json.loads(raw_content.strip())
+            sql_raw = parsed["sql"]
+        except (json.JSONDecodeError, KeyError) as e:
+            raise ValueError(f"Unexpected response format: {raw_content}") from e
+
+        print(sql_raw)
+        
+        sql = strip_sql_fences(sql_raw)
+
+        try:
+            guard_read_only(sql)
+            validate_sql_basic(sql)
+        except Exception as guard_err:
+            safe_msg = f"Blocked unsafe SQL. Reason: {guard_err}"
+            assistant_message = Message.text_message(safe_msg, role="assistant")
+            return DBQueryState(context=[*state.context, assistant_message], user_id=user_id)
+        
+        try:
+            pg_pool = await self._create_pg_pool(pg_pool=None, postgres_dsn=self.db_url, pool_config={})
+            rows = await execute_query_readonly(pg_pool, sql, limit=50, timeout_s=25)
+        except Exception as exec_err:
+            assistant_message = Message.text_message(
+                f"SQL:\n{sql}\n\nExecution error: {exec_err}", role="assistant"
+            )
+            return DBQueryState(context=[*state.context, assistant_message], user_id=user_id)
+
+
+        preview = rows[:10]
+        result_note = f"Returned {len(rows)} row(s). Showing up to 10."
+        try:
+            pretty = json.dumps(preview, default=str)  # be safe with non-JSON types
+        except Exception:
+            pretty = str(preview)
+
+        answer = f"SQL:\n{sql}\n\n{result_note}\n\nRows (up to 10):\n{pretty}"
+        assistant_message = Message.text_message(answer, role="assistant")
 
         # Store the conversation in memory using store's message storage
         try:
@@ -638,15 +810,16 @@ Show that you remember previous topics and user preferences."""
             )
 
             # Store assistant response
-            assistant_msg = Message.text_message(assistant_content, role="assistant")
+            # assistant_msg = Message.text_message(answer, role="assistant")
             await store.astore(
                 config,
-                content=assistant_msg,
+                content=assistant_message,
                 memory_type=MemoryType.EPISODIC,  # Use episodic for compatibility
                 category="chat",
                 metadata={
                     "session_id": "main_chat",
                     "interaction_type": "assistant_response",
+                    "sql": sql,
                 },
             )
 
@@ -658,3 +831,32 @@ Show that you remember previous topics and user preferences."""
 
         # Return updated state with new message
         return DBQueryState(context=[*state.context, assistant_message], user_id=state.user_id)
+
+    def _build_graph(self):
+        graph = StateGraph[DBQueryState](DBQueryState())
+        graph.add_node("main_agent", self.main_agent)
+        graph.set_entry_point("main_agent")
+        graph.add_edge("main_agent", END)
+        default_config = {
+            "vector_store": {
+                "provider": "qdrant",
+                "config": {
+                    "collection_name": "persistent_store",
+                    "url": os.getenv("QDRANT_URL"),
+                    "api_key": os.getenv("QDRANT_API_KEY"),
+                    "embedding_model_dims": 768,
+                },
+            },
+            "embedder": {
+                "provider": "gemini",
+                "config": {"model": "models/text-embedding-004"},
+            },
+            "llm": {
+                "provider": "gemini",
+                "config": {"model": "gemini-2.0-flash-exp",
+                           "temperature": 0.1},
+            },
+        }
+        cur_store = create_mem0_store(config=default_config, user_id="db_agent", thread_id="db_agent_thread", app_id="db_agent")
+        app = graph.compile(store=cur_store)
+        return app
